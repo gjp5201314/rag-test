@@ -1,0 +1,26 @@
+# 虚拟环境
+venv/
+env/
+*.venv/
+
+# 向量数据库
+chroma_db/
+*.bin
+*.sqlite3
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志文件
+*.log
+
+# 环境变量文件（防止 API Key 泄露！）
+.env
+
+# 其他大文件/临时文件
+*.egg-info/
+dist/
+build/
