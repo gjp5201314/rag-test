@@ -84,6 +84,37 @@ python app.py serve --host 127.0.0.1 --port 7860
 http://127.0.0.1:7860
 ```
 
+## 部署到 Render
+
+仓库中已提供 [`render.yaml`](render.yaml)，可直接用于 Render Blueprint / Web Service 部署。
+
+### 1. 连接仓库
+
+将当前 GitHub 仓库导入 Render。
+
+### 2. 构建与启动
+
+[`render.yaml`](render.yaml) 中已配置：
+
+- 构建命令：`pip install -r requirements.txt`
+- 启动命令：`waitress-serve --host 0.0.0.0 --port $PORT app:app`
+
+### 3. 配置环境变量
+
+在 Render 控制台中设置：
+
+```env
+DASHSCOPE_API_KEY=你的千问密钥
+QWEN_MODEL=qwen-plus
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+### 4. 注意事项
+
+- Render 上的 `data/` 是部署产物中的目录，不是你本机磁盘。
+- 如果你在网页中重建索引，索引文件会写入运行实例本地文件系统；免费实例重启后可能丢失，需要重新构建。
+- 如果希望知识库内容长期稳定，建议把初始文档直接提交到仓库中的 [`data/`](data/) 目录。
+
 页面中可以：
 
 1. 输入文档目录与索引路径

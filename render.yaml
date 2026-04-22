@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: rag-deepseek
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: waitress-serve --host 0.0.0.0 --port $PORT app:app
+    envVars:
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: QWEN_MODEL
+        value: qwen-plus
+      - key: QWEN_BASE_URL
+        value: https://dashscope.aliyuncs.com/compatible-mode/v1
