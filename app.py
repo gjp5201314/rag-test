@@ -3,8 +3,9 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from threading import Lock
-from typing import Iterable, List
+from threading import Lock, Thread
+from typing import Any, Iterable, List
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
@@ -70,6 +71,32 @@ class DocumentChunk:
     path: str
     chunk_id: int
     text: str
+
+
+@dataclass
+class BuildJob:
+    job_id: str
+    status: str
+    source: str
+    index_path: str
+    chunk_size: int
+    chunk_overlap: int
+    message: str = "等待开始"
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "status": self.status,
+            "source": self.source,
+            "index": self.index_path,
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            "message": self.message,
+            "result": self.result,
+            "error": self.error,
+        }
 
 
 class LocalKnowledgeBase:
@@ -248,6 +275,8 @@ class KnowledgeBaseService:
         self._lock = Lock()
         self.kb: LocalKnowledgeBase | None = None
         self.loaded_index_path: str | None = None
+        self.build_jobs: dict[str, BuildJob] = {}
+        self.active_build_job_id: str | None = None
 
     def build_index(
         self,
@@ -269,6 +298,79 @@ class KnowledgeBaseService:
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
         }
+
+    def start_build_index(
+        self,
+        source: str,
+        index_path: str,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    ) -> dict[str, Any]:
+        with self._lock:
+            active_job = self.build_jobs.get(self.active_build_job_id or "")
+            if active_job and active_job.status in {"queued", "running"}:
+                same_request = (
+                    active_job.source == source
+                    and active_job.index_path == index_path
+                    and active_job.chunk_size == chunk_size
+                    and active_job.chunk_overlap == chunk_overlap
+                )
+                if same_request:
+                    return active_job.to_dict()
+                raise ValueError("已有索引构建任务进行中，请等待当前任务完成后再试。")
+
+            job = BuildJob(
+                job_id=uuid4().hex,
+                status="queued",
+                source=source,
+                index_path=index_path,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                message="任务已创建，等待开始构建。",
+            )
+            self.build_jobs[job.job_id] = job
+            self.active_build_job_id = job.job_id
+
+        Thread(target=self._run_build_job, args=(job.job_id,), daemon=True).start()
+        return job.to_dict()
+
+    def _run_build_job(self, job_id: str) -> None:
+        with self._lock:
+            job = self.build_jobs[job_id]
+            job.status = "running"
+            job.message = "正在扫描文件并构建索引，请稍候..."
+
+        try:
+            result = self.build_index(
+                source=job.source,
+                index_path=job.index_path,
+                chunk_size=job.chunk_size,
+                chunk_overlap=job.chunk_overlap,
+            )
+            with self._lock:
+                current_job = self.build_jobs[job_id]
+                current_job.status = "completed"
+                current_job.message = f"索引构建完成：共 {result['chunks']} 个分片。"
+                current_job.result = result
+                current_job.error = None
+        except Exception as error:
+            with self._lock:
+                current_job = self.build_jobs[job_id]
+                current_job.status = "failed"
+                current_job.message = f"构建失败：{error}"
+                current_job.error = str(error)
+                current_job.result = None
+        finally:
+            with self._lock:
+                if self.active_build_job_id == job_id:
+                    self.active_build_job_id = None
+
+    def get_build_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self.build_jobs.get(job_id)
+            if job is None:
+                raise FileNotFoundError(f"构建任务不存在: {job_id}")
+            return job.to_dict()
 
     def ensure_loaded(self, index_path: str) -> LocalKnowledgeBase:
         with self._lock:
@@ -307,12 +409,14 @@ class KnowledgeBaseService:
         index_exists = index_file.exists()
         loaded = self.kb is not None and self.loaded_index_path == index_path
         document_count = len(self.kb.documents) if loaded and self.kb is not None else 0
+        active_job = self.build_jobs.get(self.active_build_job_id or "")
         return {
             "index_exists": index_exists,
             "index_path": index_path,
             "loaded": loaded,
             "document_count": document_count,
             "api_key_configured": bool(os.getenv("DASHSCOPE_API_KEY")),
+            "build_job": active_job.to_dict() if active_job else None,
         }
 
 
@@ -358,13 +462,21 @@ def api_build():
     chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
     chunk_overlap = int(payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
-    result = service.build_index(
+    result = service.start_build_index(
         source=source,
         index_path=index_path,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    return jsonify({"message": "索引构建完成", **result})
+    return jsonify(result), 202
+
+
+@app.get("/api/build-status")
+def api_build_status():
+    job_id = (request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"error": "缺少 job_id 参数"}), 400
+    return jsonify(service.get_build_job(job_id))
 
 
 @app.post("/api/ask")

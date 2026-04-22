@@ -12,6 +12,9 @@ const buildForm = document.getElementById('buildForm');
 const askForm = document.getElementById('askForm');
 const refreshStatusBtn = document.getElementById('refreshStatusBtn');
 
+let activeBuildJobId = null;
+let activeBuildPollPromise = null;
+
 function setStatusBadge(text, type) {
   statusBadge.textContent = text;
   statusBadge.className = `status-badge ${type}`;
@@ -23,6 +26,17 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function setBuildMessage(message, muted = false) {
+  buildMessageEl.className = muted ? 'message-card muted' : 'message-card';
+  buildMessageEl.textContent = message;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 async function requestJson(url, options = {}) {
   const response = await fetch(url, {
     headers: {
@@ -31,9 +45,22 @@ async function requestJson(url, options = {}) {
     ...options,
   });
 
-  const data = await response.json();
+  const rawText = await response.text();
+  let data = {};
+
+  if (rawText) {
+    try {
+      data = JSON.parse(rawText);
+    } catch (error) {
+      if (!response.ok) {
+        throw new Error(`请求失败（HTTP ${response.status}）`);
+      }
+      throw new Error('服务端返回了无效的 JSON 响应');
+    }
+  }
+
   if (!response.ok) {
-    throw new Error(data.error || '请求失败');
+    throw new Error(data.error || `请求失败（HTTP ${response.status}）`);
   }
   return data;
 }
@@ -61,11 +88,69 @@ function renderResults(results) {
     .join('');
 }
 
+async function pollBuildJob(jobId) {
+  if (activeBuildJobId === jobId && activeBuildPollPromise) {
+    return activeBuildPollPromise;
+  }
+
+  activeBuildJobId = jobId;
+  activeBuildPollPromise = (async () => {
+    while (true) {
+      const job = await requestJson(`/api/build-status?job_id=${encodeURIComponent(jobId)}`);
+
+      if (job.message) {
+        setBuildMessage(job.message, !['completed', 'failed'].includes(job.status));
+      }
+
+      if (job.status === 'completed') {
+        return job;
+      }
+
+      if (job.status === 'failed') {
+        throw new Error(job.error || job.message || '索引构建失败');
+      }
+
+      setStatusBadge('构建中', 'warn');
+      await sleep(1500);
+    }
+  })();
+
+  try {
+    return await activeBuildPollPromise;
+  } finally {
+    if (activeBuildJobId === jobId) {
+      activeBuildJobId = null;
+      activeBuildPollPromise = null;
+    }
+  }
+}
+
 function updateStatusView(data) {
   indexPathEl.textContent = data.index_path || './data/index.json';
   loadedStateEl.textContent = data.loaded ? '已加载' : '未加载';
   documentCountEl.textContent = String(data.document_count ?? 0);
   apiStateEl.textContent = data.api_key_configured ? '已配置' : '未配置';
+
+  if (data.build_job && ['queued', 'running'].includes(data.build_job.status)) {
+    setStatusBadge('构建中', 'warn');
+    if (data.build_job.message) {
+      setBuildMessage(data.build_job.message, true);
+    }
+    if (activeBuildJobId !== data.build_job.job_id) {
+      pollBuildJob(data.build_job.job_id)
+        .then(async (job) => {
+          const result = job.result || {};
+          const targetIndex = result.index || data.build_job.index || data.index_path || './data/index.json';
+          askForm.elements.index.value = targetIndex;
+          await loadStatus(targetIndex);
+        })
+        .catch((error) => {
+          setBuildMessage(`构建失败：${error.message}`);
+          setStatusBadge('异常', 'error');
+        });
+    }
+    return;
+  }
 
   if (data.loaded && data.api_key_configured) {
     setStatusBadge('就绪', 'ok');
@@ -82,7 +167,7 @@ async function loadStatus(indexPath = './data/index.json') {
     updateStatusView(data);
   } catch (error) {
     setStatusBadge('异常', 'error');
-    buildMessageEl.textContent = error.message;
+    setBuildMessage(error.message);
   }
 }
 
@@ -90,9 +175,15 @@ buildForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const formData = new FormData(buildForm);
   const payload = Object.fromEntries(formData.entries());
+  const submitButton = buildForm.querySelector('button[type="submit"]');
+  const targetIndex = payload.index || './data/index.json';
 
-  buildMessageEl.className = 'message-card muted';
-  buildMessageEl.textContent = '正在扫描文件并构建索引，请稍候...';
+  askForm.elements.index.value = targetIndex;
+  setStatusBadge('构建中', 'warn');
+  setBuildMessage('正在提交构建任务，请稍候...', true);
+  if (submitButton) {
+    submitButton.disabled = true;
+  }
 
   try {
     const data = await requestJson('/api/build', {
@@ -100,14 +191,25 @@ buildForm.addEventListener('submit', async (event) => {
       body: JSON.stringify(payload),
     });
 
-    buildMessageEl.className = 'message-card';
-    buildMessageEl.textContent = `索引构建完成：共 ${data.chunks} 个分片，索引文件为 ${data.index}`;
-    askForm.elements.index.value = data.index;
-    await loadStatus(data.index);
+    const jobId = data.job_id;
+    if (!jobId) {
+      throw new Error('服务端未返回构建任务编号');
+    }
+
+    const job = await pollBuildJob(jobId);
+    const result = job.result || {};
+    const builtIndex = result.index || targetIndex;
+
+    setBuildMessage(job.message || `索引构建完成：共 ${result.chunks ?? 0} 个分片，索引文件为 ${builtIndex}`);
+    askForm.elements.index.value = builtIndex;
+    await loadStatus(builtIndex);
   } catch (error) {
-    buildMessageEl.className = 'message-card';
-    buildMessageEl.textContent = `构建失败：${error.message}`;
+    setBuildMessage(`构建失败：${error.message}`);
     setStatusBadge('异常', 'error');
+  } finally {
+    if (submitButton) {
+      submitButton.disabled = false;
+    }
   }
 });
 
