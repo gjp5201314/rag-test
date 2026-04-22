@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>本地知识库控制台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Noto+Serif+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="noise"></div>
+  <main class="shell">
+    <section class="hero-panel">
+      <div class="hero-copy">
+        <p class="eyebrow">LOCAL ARCHIVE · QWEN</p>
+        <h1>本地知识库控制台</h1>
+        <p class="lead">
+          将你的本地文档目录编织成一个可检索、可追问、可落地使用的知识界面。
+          先构建索引，再在右侧窗口直接提问。
+        </p>
+      </div>
+
+      <div class="status-card">
+        <div>
+          <span class="label">系统状态</span>
+          <strong id="statusBadge" class="status-badge idle">检测中</strong>
+        </div>
+        <dl class="status-grid">
+          <div>
+            <dt>索引文件</dt>
+            <dd id="indexPath">./data/index.json</dd>
+          </div>
+          <div>
+            <dt>已加载</dt>
+            <dd id="loadedState">-</dd>
+          </div>
+          <div>
+            <dt>分片数量</dt>
+            <dd id="documentCount">0</dd>
+          </div>
+          <div>
+            <dt>模型密钥</dt>
+            <dd id="apiState">-</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="workspace-grid">
+      <article class="panel form-panel">
+        <div class="panel-head">
+          <p class="kicker">STEP 1</p>
+          <h2>建立索引</h2>
+        </div>
+
+        <form id="buildForm" class="stack-form">
+          <label>
+            <span>文档目录</span>
+            <input type="text" name="source" value="./data" placeholder="例如：./data" />
+          </label>
+
+          <label>
+            <span>索引文件</span>
+            <input type="text" name="index" value="./data/index.json" placeholder="例如：./data/index.json" />
+          </label>
+
+          <div class="two-col">
+            <label>
+              <span>分片长度</span>
+              <input type="number" name="chunk_size" value="1000" min="100" step="50" />
+            </label>
+            <label>
+              <span>重叠长度</span>
+              <input type="number" name="chunk_overlap" value="200" min="0" step="10" />
+            </label>
+          </div>
+
+          <button type="submit" class="action-btn primary">构建本地索引</button>
+        </form>
+
+        <div id="buildMessage" class="message-card muted">等待建立索引。</div>
+      </article>
+
+      <article class="panel qa-panel">
+        <div class="panel-head">
+          <p class="kicker">STEP 2</p>
+          <h2>开始提问</h2>
+        </div>
+
+        <form id="askForm" class="stack-form">
+          <label>
+            <span>问题</span>
+            <textarea name="question" rows="5" placeholder="例如：这个项目是如何检索本地文件并调用千问生成回答的？"></textarea>
+          </label>
+
+          <div class="two-col">
+            <label>
+              <span>索引文件</span>
+              <input type="text" name="index" value="./data/index.json" />
+            </label>
+            <label>
+              <span>Top-K</span>
+              <input type="number" name="top_k" value="5" min="1" max="20" />
+            </label>
+          </div>
+
+          <button type="submit" class="action-btn">发送问题</button>
+        </form>
+
+        <div id="answerBlock" class="answer-block empty">
+          <div class="answer-header">
+            <span>模型回答</span>
+            <span id="answerMeta">尚未提问</span>
+          </div>
+          <div id="answerContent" class="answer-content">这里会显示千问基于检索上下文生成的回答。</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="results-panel panel">
+      <div class="panel-head inline">
+        <div>
+          <p class="kicker">RETRIEVAL TRACE</p>
+          <h2>命中文档分片</h2>
+        </div>
+        <button id="refreshStatusBtn" class="ghost-btn" type="button">刷新状态</button>
+      </div>
+      <div id="resultsList" class="results-list empty">
+        <div class="empty-state">提问后会展示命中的文件、分片号、相似度与片段内容。</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
