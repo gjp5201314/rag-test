@@ -1,7 +1,9 @@
 import argparse
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
+from heapq import nlargest
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, Iterable, List
@@ -9,12 +11,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
-from joblib import dump as joblib_dump
-from joblib import load as joblib_load
 from openai import OpenAI
-from scipy.sparse import load_npz, save_npz
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from werkzeug.exceptions import HTTPException
 
 
@@ -69,16 +66,6 @@ DEFAULT_QWEN_MODEL = "qwen-plus"
 DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
-def get_vectorizer_cache_path(index_path: str) -> Path:
-    path = Path(index_path)
-    return path.with_name(f"{path.name}.vectorizer.joblib")
-
-
-def get_matrix_cache_path(index_path: str) -> Path:
-    path = Path(index_path)
-    return path.with_name(f"{path.name}.matrix.npz")
-
-
 @dataclass
 class DocumentChunk:
     path: str
@@ -117,24 +104,15 @@ class LocalKnowledgeBase:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.documents: List[DocumentChunk] = []
-        self.vectorizer: TfidfVectorizer | None = None
-        self.matrix = None
 
     def build(self, root_dir: str) -> int:
         self.documents = list(self._load_documents(root_dir))
         if not self.documents:
             raise ValueError(f"在目录 {root_dir} 中没有找到可索引的文本文件。")
-
-        self.vectorizer = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(2, 4),
-            lowercase=False,
-        )
-        self.matrix = self.vectorizer.fit_transform(doc.text for doc in self.documents).astype("float32")
         return len(self.documents)
 
     def save(self, index_path: str) -> None:
-        if self.vectorizer is None or self.matrix is None:
+        if not self.documents:
             raise ValueError("索引尚未构建，不能保存。")
 
         payload = {
@@ -160,39 +138,27 @@ class LocalKnowledgeBase:
             chunk_size=payload.get("chunk_size", DEFAULT_CHUNK_SIZE),
             chunk_overlap=payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP),
         )
-        kb.documents = [DocumentChunk(**item) for item in payload["documents"]]
-        vectorizer_path = get_vectorizer_cache_path(index_path)
-        matrix_path = get_matrix_cache_path(index_path)
-        if vectorizer_path.exists() and matrix_path.exists():
-            kb.vectorizer = joblib_load(vectorizer_path)
-            kb.matrix = load_npz(matrix_path)
-        else:
-            kb.vectorizer = TfidfVectorizer(
-                analyzer="char_wb",
-                ngram_range=(2, 4),
-                lowercase=False,
-            )
-            kb.matrix = kb.vectorizer.fit_transform(doc.text for doc in kb.documents).astype("float32")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            joblib_dump(kb.vectorizer, vectorizer_path, compress=3)
-            save_npz(matrix_path, kb.matrix, compressed=True)
+        kb.documents = [
+            DocumentChunk(**item)
+            for item in payload["documents"]
+            if Path(item["path"]).name not in DEFAULT_EXCLUDED_FILE_NAMES
+        ]
         return kb
 
     def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[dict]:
-        if self.vectorizer is None or self.matrix is None:
+        if not self.documents:
             raise ValueError("知识库未初始化，请先构建或加载索引。")
+        query = query.strip()
+        if not query:
+            return []
 
-        query_vector = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vector, self.matrix).flatten()
-        ranked_indices = similarities.argsort()[::-1][:top_k]
-
-        results = []
-        for idx in ranked_indices:
-            score = float(similarities[idx])
+        query_terms = self._extract_query_terms(query)
+        scored_results = []
+        for doc in self.documents:
+            score = self._score_document(query, query_terms, doc.text)
             if score <= 0:
                 continue
-            doc = self.documents[idx]
-            results.append(
+            scored_results.append(
                 {
                     "path": doc.path,
                     "chunk_id": doc.chunk_id,
@@ -200,7 +166,64 @@ class LocalKnowledgeBase:
                     "text": doc.text,
                 }
             )
-        return results
+
+        top_results = nlargest(top_k, scored_results, key=lambda item: item["score"])
+        if not top_results:
+            return []
+
+        max_score = max(item["score"] for item in top_results)
+        if max_score <= 0:
+            return []
+
+        for item in top_results:
+            item["score"] = round(float(item["score"] / max_score), 4)
+        return top_results
+
+    def _extract_query_terms(self, query: str) -> list[str]:
+        normalized_query = self._normalize_text(query)
+        terms: list[str] = []
+
+        ascii_terms = re.findall(r"[a-z0-9]{2,}", normalized_query)
+        terms.extend(ascii_terms)
+
+        chinese_chars = [char for char in query if "\u4e00" <= char <= "\u9fff"]
+        for size in (4, 3, 2):
+            if len(chinese_chars) < size:
+                continue
+            for index in range(len(chinese_chars) - size + 1):
+                terms.append("".join(chinese_chars[index : index + size]))
+
+        if not terms:
+            terms.append(normalized_query)
+
+        deduped_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            cleaned = term.strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            deduped_terms.append(cleaned)
+        return deduped_terms
+
+    def _score_document(self, query: str, query_terms: list[str], text: str) -> float:
+        normalized_text = self._normalize_text(text)
+        normalized_query = self._normalize_text(query)
+        score = 0.0
+
+        if normalized_query and normalized_query in normalized_text:
+            score += min(len(normalized_query), 24) * 3.0
+
+        for term in query_terms:
+            occurrences = normalized_text.count(term)
+            if occurrences <= 0:
+                continue
+            score += occurrences * max(len(term), 1)
+
+        return score
+
+    def _normalize_text(self, text: str) -> str:
+        return re.sub(r"\s+", " ", text.lower()).strip()
 
     def _load_documents(self, root_dir: str) -> Iterable[DocumentChunk]:
         root = Path(root_dir)
