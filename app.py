@@ -3,13 +3,16 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Iterable, List
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
+from joblib import dump as joblib_dump
+from joblib import load as joblib_load
 from openai import OpenAI
+from scipy.sparse import load_npz, save_npz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from werkzeug.exceptions import HTTPException
@@ -66,6 +69,16 @@ DEFAULT_QWEN_MODEL = "qwen-plus"
 DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
+def get_vectorizer_cache_path(index_path: str) -> Path:
+    path = Path(index_path)
+    return path.with_name(f"{path.name}.vectorizer.joblib")
+
+
+def get_matrix_cache_path(index_path: str) -> Path:
+    path = Path(index_path)
+    return path.with_name(f"{path.name}.matrix.npz")
+
+
 @dataclass
 class DocumentChunk:
     path: str
@@ -117,7 +130,7 @@ class LocalKnowledgeBase:
             ngram_range=(2, 4),
             lowercase=False,
         )
-        self.matrix = self.vectorizer.fit_transform(doc.text for doc in self.documents)
+        self.matrix = self.vectorizer.fit_transform(doc.text for doc in self.documents).astype("float32")
         return len(self.documents)
 
     def save(self, index_path: str) -> None:
@@ -133,6 +146,8 @@ class LocalKnowledgeBase:
         path = Path(index_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        joblib_dump(self.vectorizer, get_vectorizer_cache_path(index_path), compress=3)
+        save_npz(get_matrix_cache_path(index_path), self.matrix, compressed=True)
 
     @classmethod
     def load(cls, index_path: str) -> "LocalKnowledgeBase":
@@ -146,12 +161,21 @@ class LocalKnowledgeBase:
             chunk_overlap=payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP),
         )
         kb.documents = [DocumentChunk(**item) for item in payload["documents"]]
-        kb.vectorizer = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(2, 4),
-            lowercase=False,
-        )
-        kb.matrix = kb.vectorizer.fit_transform(doc.text for doc in kb.documents)
+        vectorizer_path = get_vectorizer_cache_path(index_path)
+        matrix_path = get_matrix_cache_path(index_path)
+        if vectorizer_path.exists() and matrix_path.exists():
+            kb.vectorizer = joblib_load(vectorizer_path)
+            kb.matrix = load_npz(matrix_path)
+        else:
+            kb.vectorizer = TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=(2, 4),
+                lowercase=False,
+            )
+            kb.matrix = kb.vectorizer.fit_transform(doc.text for doc in kb.documents).astype("float32")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            joblib_dump(kb.vectorizer, vectorizer_path, compress=3)
+            save_npz(matrix_path, kb.matrix, compressed=True)
         return kb
 
     def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[dict]:
@@ -277,6 +301,10 @@ class KnowledgeBaseService:
         self.loaded_index_path: str | None = None
         self.build_jobs: dict[str, BuildJob] = {}
         self.active_build_job_id: str | None = None
+        self.loading_indexes: dict[str, Event] = {}
+        self.loading_errors: dict[str, str] = {}
+        self.warmup_started = False
+        self.warmup_error: str | None = None
 
     def build_index(
         self,
@@ -373,15 +401,60 @@ class KnowledgeBaseService:
             return job.to_dict()
 
     def ensure_loaded(self, index_path: str) -> LocalKnowledgeBase:
+        wait_event: Event | None = None
+        should_load = False
         with self._lock:
             if self.kb is not None and self.loaded_index_path == index_path:
                 return self.kb
 
-        kb = LocalKnowledgeBase.load(index_path)
+            wait_event = self.loading_indexes.get(index_path)
+            if wait_event is None:
+                wait_event = Event()
+                self.loading_indexes[index_path] = wait_event
+                self.loading_errors.pop(index_path, None)
+                should_load = True
+
+        if not should_load:
+            wait_event.wait()
+            with self._lock:
+                if self.kb is not None and self.loaded_index_path == index_path:
+                    return self.kb
+                error_message = self.loading_errors.get(index_path)
+            if error_message:
+                raise RuntimeError(error_message)
+            raise FileNotFoundError(f"索引文件不存在: {index_path}")
+
+        try:
+            kb = LocalKnowledgeBase.load(index_path)
+            with self._lock:
+                self.kb = kb
+                self.loaded_index_path = index_path
+            return kb
+        except Exception as error:
+            with self._lock:
+                self.loading_errors[index_path] = str(error)
+            raise
+        finally:
+            with self._lock:
+                current_event = self.loading_indexes.pop(index_path, None)
+                if current_event is not None:
+                    current_event.set()
+
+    def start_warmup(self, index_path: str = DEFAULT_INDEX_PATH) -> None:
         with self._lock:
-            self.kb = kb
-            self.loaded_index_path = index_path
-        return kb
+            if self.warmup_started:
+                return
+            self.warmup_started = True
+
+        Thread(target=self._warmup_index, args=(index_path,), daemon=True).start()
+
+    def _warmup_index(self, index_path: str) -> None:
+        try:
+            if Path(index_path).exists():
+                self.ensure_loaded(index_path)
+        except Exception as error:
+            with self._lock:
+                self.warmup_error = str(error)
 
     def ask(self, question: str, index_path: str, top_k: int = DEFAULT_TOP_K) -> dict:
         load_dotenv()
@@ -410,6 +483,7 @@ class KnowledgeBaseService:
         loaded = self.kb is not None and self.loaded_index_path == index_path
         document_count = len(self.kb.documents) if loaded and self.kb is not None else 0
         active_job = self.build_jobs.get(self.active_build_job_id or "")
+        warming_up = index_path in self.loading_indexes
         return {
             "index_exists": index_exists,
             "index_path": index_path,
@@ -417,6 +491,8 @@ class KnowledgeBaseService:
             "document_count": document_count,
             "api_key_configured": bool(os.getenv("DASHSCOPE_API_KEY")),
             "build_job": active_job.to_dict() if active_job else None,
+            "warming_up": warming_up,
+            "warmup_error": self.warmup_error if index_path == DEFAULT_INDEX_PATH else None,
         }
 
 
@@ -428,6 +504,7 @@ def get_env(name: str, default: str | None = None) -> str:
 
 
 service = KnowledgeBaseService()
+service.start_warmup()
 app = Flask(__name__)
 
 

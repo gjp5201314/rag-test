@@ -2,4 +2,7 @@
 .venv/
 __pycache__/
 data/index.json
+data/*.joblib
+data/*.npz
+tmp_test_data/
 .roo/

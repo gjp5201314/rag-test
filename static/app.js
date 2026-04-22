@@ -152,6 +152,12 @@ function updateStatusView(data) {
     return;
   }
 
+  if (data.warming_up) {
+    setStatusBadge('预热中', 'warn');
+    setBuildMessage('正在后台预加载索引，首次提问会更快，请稍候...', true);
+    return;
+  }
+
   if (data.loaded && data.api_key_configured) {
     setStatusBadge('就绪', 'ok');
   } else if (data.index_exists) {
