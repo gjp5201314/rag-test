@@ -56,6 +56,7 @@ IGNORE_DIRS = {
 
 DEFAULT_SOURCE_DIR = "./data"
 DEFAULT_INDEX_PATH = "./data/index.json"
+DEFAULT_CHUNKS_DIR = "./data/chunks"
 DEFAULT_EXCLUDED_FILE_NAMES = {
     "index.json",
 }
@@ -64,6 +65,14 @@ DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_TOP_K = 5
 DEFAULT_QWEN_MODEL = "qwen-plus"
 DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+DOCUMENT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".tsx", ".jsx", ".json",
+    ".yaml", ".yml", ".toml", ".ini", ".csv", ".html", ".css",
+    ".java", ".go", ".rs", ".c", ".cpp", ".h", ".hpp", ".sql", ".log",
+}
+
+OFFICE_EXTENSIONS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
 
 
 def get_vectorizer_cache_path(index_path: str) -> str:
@@ -109,8 +118,9 @@ class BuildJob:
     status: str
     source: str
     index_path: str
-    chunk_size: int
-    chunk_overlap: int
+    chunks_dir: str = DEFAULT_CHUNKS_DIR
+    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     message: str = "等待开始"
     result: dict[str, Any] | None = None
     error: str | None = None
@@ -121,6 +131,7 @@ class BuildJob:
             "status": self.status,
             "source": self.source,
             "index": self.index_path,
+            "chunks_dir": self.chunks_dir,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
             "message": self.message,
@@ -262,6 +273,8 @@ class LocalKnowledgeBase:
         if not root.exists():
             raise FileNotFoundError(f"目录不存在: {root_dir}")
 
+        all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+
         for file_path in root.rglob("*"):
             if not file_path.is_file():
                 continue
@@ -269,7 +282,7 @@ class LocalKnowledgeBase:
                 continue
             if file_path.name in DEFAULT_EXCLUDED_FILE_NAMES:
                 continue
-            if file_path.suffix.lower() not in TEXT_EXTENSIONS:
+            if file_path.suffix.lower() not in all_extensions:
                 continue
 
             text = self._read_text_file(file_path)
@@ -281,6 +294,17 @@ class LocalKnowledgeBase:
                 yield DocumentChunk(path=relative_path, chunk_id=chunk_id, text=chunk_text)
 
     def _read_text_file(self, file_path: Path) -> str:
+        suffix = file_path.suffix.lower()
+
+        if suffix == ".pdf":
+            return self._read_pdf_file(file_path)
+        elif suffix in {".docx", ".doc"}:
+            return self._read_docx_file(file_path)
+        elif suffix in {".pptx", ".ppt"}:
+            return self._read_pptx_file(file_path)
+        elif suffix in {".xlsx", ".xls"}:
+            return self._read_xlsx_file(file_path)
+
         encodings = ["utf-8", "utf-8-sig", "gbk", "gb18030"]
         for encoding in encodings:
             try:
@@ -290,6 +314,68 @@ class LocalKnowledgeBase:
             except OSError:
                 return ""
         return ""
+
+    def _read_pdf_file(self, file_path: Path) -> str:
+        try:
+            import PyPDF2
+            with open(file_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text() or ""
+                return text
+        except ImportError:
+            try:
+                import pdfplumber
+                with pdfplumber.open(file_path) as pdf:
+                    text = ""
+                    for page in pdf.pages:
+                        text += page.extract_text() or ""
+                    return text
+            except ImportError:
+                return ""
+        except Exception:
+            return ""
+
+    def _read_docx_file(self, file_path: Path) -> str:
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            return "\n".join([para.text for para in doc.paragraphs])
+        except ImportError:
+            return ""
+        except Exception:
+            return ""
+
+    def _read_pptx_file(self, file_path: Path) -> str:
+        try:
+            from pptx import Presentation
+            prs = Presentation(file_path)
+            text = ""
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text += shape.text + "\n"
+            return text
+        except ImportError:
+            return ""
+        except Exception:
+            return ""
+
+    def _read_xlsx_file(self, file_path: Path) -> str:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            text = ""
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                for row in ws.iter_rows(values_only=True):
+                    text += " ".join([str(cell) for cell in row if cell is not None]) + "\n"
+            return text
+        except ImportError:
+            return ""
+        except Exception:
+            return ""
 
     def _split_text(self, text: str) -> List[str]:
         text = text.replace("\r\n", "\n").strip()
@@ -307,6 +393,23 @@ class LocalKnowledgeBase:
                 break
             start = max(end - self.chunk_overlap, start + 1)
         return chunks
+
+    def save_chunks_to_files(self, root_dir: str, chunks_dir: str) -> None:
+        chunks_path = Path(chunks_dir)
+        chunks_path.mkdir(parents=True, exist_ok=True)
+
+        root = Path(root_dir)
+        file_chunk_counts = {}
+
+        for doc in self.documents:
+            source_file = doc.path
+            if source_file not in file_chunk_counts:
+                file_chunk_counts[source_file] = 0
+
+            safe_filename = source_file.replace(os.sep, "_").replace(" ", "_")
+            chunk_file = chunks_path / f"{safe_filename}_chunk{doc.chunk_id}.txt"
+            chunk_file.write_text(doc.text, encoding="utf-8")
+            file_chunk_counts[source_file] += 1
 
 
 class QwenChat:
@@ -365,18 +468,21 @@ class KnowledgeBaseService:
         self,
         source: str,
         index_path: str,
+        chunks_dir: str = DEFAULT_CHUNKS_DIR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> dict:
         kb = LocalKnowledgeBase(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         count = kb.build(source)
         kb.save(index_path)
+        kb.save_chunks_to_files(source, chunks_dir)
         with self._lock:
             self.kb = kb
             self.loaded_index_path = index_path
         return {
             "source": source,
             "index": index_path,
+            "chunks_dir": chunks_dir,
             "chunks": count,
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
@@ -386,6 +492,7 @@ class KnowledgeBaseService:
         self,
         source: str,
         index_path: str,
+        chunks_dir: str = DEFAULT_CHUNKS_DIR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> dict[str, Any]:
@@ -407,6 +514,7 @@ class KnowledgeBaseService:
                 status="queued",
                 source=source,
                 index_path=index_path,
+                chunks_dir=chunks_dir,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 message="任务已创建，等待开始构建。",
@@ -427,6 +535,7 @@ class KnowledgeBaseService:
             result = self.build_index(
                 source=job.source,
                 index_path=job.index_path,
+                chunks_dir=job.chunks_dir,
                 chunk_size=job.chunk_size,
                 chunk_overlap=job.chunk_overlap,
             )
@@ -495,21 +604,33 @@ class KnowledgeBaseService:
                 if current_event is not None:
                     current_event.set()
 
-    def start_warmup(self, index_path: str = DEFAULT_INDEX_PATH) -> None:
+    def start_warmup(self, index_path: str = DEFAULT_INDEX_PATH, source_dir: str = DEFAULT_SOURCE_DIR, chunks_dir: str = DEFAULT_CHUNKS_DIR) -> None:
         with self._lock:
             if self.warmup_started:
                 return
             self.warmup_started = True
 
-        Thread(target=self._warmup_index, args=(index_path,), daemon=True).start()
+        Thread(target=self._warmup_index, args=(index_path, source_dir, chunks_dir), daemon=True).start()
 
-    def _warmup_index(self, index_path: str) -> None:
+    def _warmup_index(self, index_path: str, source_dir: str, chunks_dir: str) -> None:
         try:
             if Path(index_path).exists():
                 self.ensure_loaded(index_path)
+                print(f"[预热] 已加载现有索引: {index_path}")
+            else:
+                print(f"[预热] 索引文件不存在，开始自动构建索引...")
+                print(f"[预热] 扫描目录: {source_dir}")
+                result = self.build_index(
+                    source=source_dir,
+                    index_path=index_path,
+                    chunks_dir=chunks_dir,
+                )
+                print(f"[预热] 索引构建完成：共 {result['chunks']} 个分片，已保存到 {result['index']}")
+                print(f"[预热] 分片文件已保存到: {result['chunks_dir']}")
         except Exception as error:
             with self._lock:
                 self.warmup_error = str(error)
+            print(f"[预热] 错误: {error}")
 
     def ask(self, question: str, index_path: str, top_k: int = DEFAULT_TOP_K) -> dict:
         load_dotenv()
@@ -564,9 +685,6 @@ app = Flask(__name__)
 
 # 支持 Render 部署：读取 PORT 环境变量
 port = int(os.getenv('PORT', 7860))
-if __name__ == '__main__':
-    # 在生产环境中，监听 0.0.0.0 以接受外部请求
-    app.run(host='0.0.0.0', port=port, debug=False)
 
 
 @app.get("/")
@@ -597,12 +715,14 @@ def api_build():
     payload = request.get_json(silent=True) or {}
     source = payload.get("source", DEFAULT_SOURCE_DIR)
     index_path = payload.get("index", DEFAULT_INDEX_PATH)
+    chunks_dir = payload.get("chunks_dir", DEFAULT_CHUNKS_DIR)
     chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
     chunk_overlap = int(payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
     result = service.start_build_index(
         source=source,
         index_path=index_path,
+        chunks_dir=chunks_dir,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
