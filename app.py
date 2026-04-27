@@ -11,10 +11,8 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
-from joblib import dump as joblib_dump
 from openai import OpenAI
 from werkzeug.exceptions import HTTPException
-import numpy as np
 
 
 TEXT_EXTENSIONS = {
@@ -82,11 +80,13 @@ def get_matrix_cache_path(index_path: str) -> str:
 
 def joblib_dump(obj, file_path: str, compress: int = 3) -> None:
     """使用 joblib 保存对象"""
-    dump(obj, file_path, compress=compress)
+    import joblib
+    joblib.dump(obj, file_path, compress=compress)
 
 
 def save_npz(file_path: str, matrix, compressed: bool = True) -> None:
     """保存 numpy 矩阵为 npz 格式"""
+    import numpy as np
     if matrix is None:
         np.savez_compressed(file_path) if compressed else np.savez(file_path)
         return
