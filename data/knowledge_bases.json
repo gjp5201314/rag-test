@@ -7,6 +7,14 @@
       "created_at": "2026-04-27T21:43:27.300319",
       "document_count": 28880,
       "chunk_count": 19252
+    },
+    {
+      "id": "8b3591d3",
+      "name": "测试PDF知识库",
+      "description": "测试PDF上传",
+      "created_at": "2026-04-27T22:36:10.551020",
+      "document_count": 6,
+      "chunk_count": 2
     }
   ]
 }

@@ -533,9 +533,13 @@ class KnowledgeBaseService:
         return str(Path(DEFAULT_KB_DIR) / kb_id)
 
     def _get_kb_index_path(self, kb_id: str) -> str:
+        if kb_id == "default":
+            return DEFAULT_INDEX_PATH
         return str(Path(DEFAULT_KB_DIR) / kb_id / "index.json")
 
     def _get_kb_chunks_dir(self, kb_id: str) -> str:
+        if kb_id == "default":
+            return DEFAULT_CHUNKS_DIR
         return str(Path(DEFAULT_KB_DIR) / kb_id / "chunks")
 
     def _get_kb_upload_dir(self, kb_id: str) -> str:
@@ -594,12 +598,28 @@ class KnowledgeBaseService:
         upload_dir = Path(self._get_kb_upload_dir(kb_id))
         upload_dir.mkdir(parents=True, exist_ok=True)
         
-        filename = secure_filename(file.filename)
-        file_path = upload_dir / filename
+        original_filename = file.filename
+        
+        safe_name = secure_filename(original_filename)
+        if not safe_name or safe_name.strip() == "":
+            name_part = original_filename.rsplit(".", 1)[0] if "." in original_filename else original_filename
+            ext_part = original_filename.rsplit(".", 1)[-1] if "." in original_filename else ""
+            safe_name = f"{name_part}.{ext_part}" if ext_part else name_part
+        
+        safe_name = "".join(c for c in safe_name if c not in r'<>:"/\|?*')
+        
+        file_path = upload_dir / safe_name
+        counter = 1
+        while file_path.exists():
+            name = file_path.stem
+            ext = file_path.suffix
+            file_path = upload_dir / f"{name}_{counter}{ext}"
+            counter += 1
+        
         file.save(str(file_path))
         
         return {
-            "filename": filename,
+            "filename": safe_name,
             "path": str(file_path),
             "size": file_path.stat().st_size,
         }
@@ -1003,12 +1023,17 @@ def api_build():
     chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
     chunk_overlap = int(payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
-    upload_dir = service._get_kb_upload_dir(kb_id)
-    index_path = service._get_kb_index_path(kb_id)
-    chunks_dir = service._get_kb_chunks_dir(kb_id)
+    if kb_id == "default":
+        source_dir = DEFAULT_SOURCE_DIR
+        index_path = DEFAULT_INDEX_PATH
+        chunks_dir = DEFAULT_CHUNKS_DIR
+    else:
+        source_dir = service._get_kb_upload_dir(kb_id)
+        index_path = service._get_kb_index_path(kb_id)
+        chunks_dir = service._get_kb_chunks_dir(kb_id)
 
     result = service.start_build_index(
-        source=upload_dir,
+        source=source_dir,
         index_path=index_path,
         kb_id=kb_id,
         chunks_dir=chunks_dir,
