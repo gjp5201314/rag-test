@@ -1,0 +1,12 @@
+{
+  "bases": [
+    {
+      "id": "default",
+      "name": "剑来知识库",
+      "description": "剑来小说1-500章本地知识库",
+      "created_at": "2026-04-27T21:43:27.300319",
+      "document_count": 28880,
+      "chunk_count": 19252
+    }
+  ]
+}

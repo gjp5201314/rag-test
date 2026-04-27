@@ -2,17 +2,20 @@ import argparse
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+import shutil
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from heapq import nlargest
 from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Any, Iterable, List
+from typing import Any, Iterable, List, Optional
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from openai import OpenAI
 from werkzeug.exceptions import HTTPException
+from werkzeug.utils import secure_filename
 
 
 TEXT_EXTENSIONS = {
@@ -52,13 +55,17 @@ IGNORE_DIRS = {
     ".vscode",
     "dist",
     "build",
+    "chunks",
 }
 
 DEFAULT_SOURCE_DIR = "./data"
 DEFAULT_INDEX_PATH = "./data/index.json"
 DEFAULT_CHUNKS_DIR = "./data/chunks"
+DEFAULT_KB_DIR = "./data/knowledge_bases"
+DEFAULT_KB_META_PATH = "./data/knowledge_bases.json"
 DEFAULT_EXCLUDED_FILE_NAMES = {
     "index.json",
+    "knowledge_bases.json",
 }
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 200
@@ -73,6 +80,10 @@ DOCUMENT_EXTENSIONS = {
 }
 
 OFFICE_EXTENSIONS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
+
+UPLOAD_FOLDER = "./data/uploads"
+ALLOWED_EXTENSIONS = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024
 
 
 def get_vectorizer_cache_path(index_path: str) -> str:
@@ -113,11 +124,32 @@ class DocumentChunk:
 
 
 @dataclass
+class KnowledgeBaseInfo:
+    id: str
+    name: str
+    description: str = ""
+    created_at: str = ""
+    document_count: int = 0
+    chunk_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at,
+            "document_count": self.document_count,
+            "chunk_count": self.chunk_count,
+        }
+
+
+@dataclass
 class BuildJob:
     job_id: str
     status: str
     source: str
     index_path: str
+    kb_id: str = "default"
     chunks_dir: str = DEFAULT_CHUNKS_DIR
     chunk_size: int = DEFAULT_CHUNK_SIZE
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
@@ -131,6 +163,7 @@ class BuildJob:
             "status": self.status,
             "source": self.source,
             "index": self.index_path,
+            "kb_id": self.kb_id,
             "chunks_dir": self.chunks_dir,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
@@ -457,17 +490,159 @@ class KnowledgeBaseService:
         self._lock = Lock()
         self.kb: LocalKnowledgeBase | None = None
         self.loaded_index_path: str | None = None
+        self.loaded_kb_id: str | None = None
         self.build_jobs: dict[str, BuildJob] = {}
         self.active_build_job_id: str | None = None
         self.loading_indexes: dict[str, Event] = {}
         self.loading_errors: dict[str, str] = {}
         self.warmup_started = False
         self.warmup_error: str | None = None
+        self._ensure_default_kb()
+
+    def _ensure_default_kb(self) -> None:
+        Path(DEFAULT_KB_DIR).mkdir(parents=True, exist_ok=True)
+        Path(UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+        
+        meta_path = Path(DEFAULT_KB_META_PATH)
+        if not meta_path.exists():
+            default_kb = KnowledgeBaseInfo(
+                id="default",
+                name="剑来知识库",
+                description="剑来小说1-500章本地知识库",
+                created_at=datetime.now().isoformat(),
+            )
+            self._save_kb_meta([default_kb])
+
+    def _load_kb_meta(self) -> List[KnowledgeBaseInfo]:
+        meta_path = Path(DEFAULT_KB_META_PATH)
+        if not meta_path.exists():
+            return []
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            return [KnowledgeBaseInfo(**item) for item in data.get("bases", [])]
+        except Exception:
+            return []
+
+    def _save_kb_meta(self, bases: List[KnowledgeBaseInfo]) -> None:
+        meta_path = Path(DEFAULT_KB_META_PATH)
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"bases": [kb.to_dict() for kb in bases]}
+        meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _get_kb_path(self, kb_id: str) -> str:
+        return str(Path(DEFAULT_KB_DIR) / kb_id)
+
+    def _get_kb_index_path(self, kb_id: str) -> str:
+        return str(Path(DEFAULT_KB_DIR) / kb_id / "index.json")
+
+    def _get_kb_chunks_dir(self, kb_id: str) -> str:
+        return str(Path(DEFAULT_KB_DIR) / kb_id / "chunks")
+
+    def _get_kb_upload_dir(self, kb_id: str) -> str:
+        return str(Path(UPLOAD_FOLDER) / kb_id)
+
+    def list_knowledge_bases(self) -> List[dict]:
+        bases = self._load_kb_meta()
+        result = []
+        for kb in bases:
+            index_path = Path(self._get_kb_index_path(kb.id))
+            kb_info = kb.to_dict()
+            kb_info["index_exists"] = index_path.exists()
+            result.append(kb_info)
+        return result
+
+    def create_knowledge_base(self, name: str, description: str = "") -> dict:
+        kb_id = uuid4().hex[:8]
+        kb = KnowledgeBaseInfo(
+            id=kb_id,
+            name=name,
+            description=description,
+            created_at=datetime.now().isoformat(),
+        )
+        bases = self._load_kb_meta()
+        bases.append(kb)
+        self._save_kb_meta(bases)
+        
+        kb_dir = Path(self._get_kb_path(kb_id))
+        kb_dir.mkdir(parents=True, exist_ok=True)
+        (kb_dir / "chunks").mkdir(parents=True, exist_ok=True)
+        
+        upload_dir = Path(self._get_kb_upload_dir(kb_id))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        return kb.to_dict()
+
+    def delete_knowledge_base(self, kb_id: str) -> bool:
+        if kb_id == "default":
+            raise ValueError("不能删除默认知识库")
+        
+        bases = self._load_kb_meta()
+        bases = [kb for kb in bases if kb.id != kb_id]
+        self._save_kb_meta(bases)
+        
+        kb_dir = Path(self._get_kb_path(kb_id))
+        if kb_dir.exists():
+            shutil.rmtree(kb_dir)
+        
+        upload_dir = Path(self._get_kb_upload_dir(kb_id))
+        if upload_dir.exists():
+            shutil.rmtree(upload_dir)
+        
+        return True
+
+    def upload_file(self, kb_id: str, file) -> dict:
+        upload_dir = Path(self._get_kb_upload_dir(kb_id))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        filename = secure_filename(file.filename)
+        file_path = upload_dir / filename
+        file.save(str(file_path))
+        
+        return {
+            "filename": filename,
+            "path": str(file_path),
+            "size": file_path.stat().st_size,
+        }
+
+    def list_uploaded_files(self, kb_id: str) -> List[dict]:
+        if kb_id == "default":
+            source_dir = Path(DEFAULT_SOURCE_DIR)
+        else:
+            source_dir = Path(self._get_kb_upload_dir(kb_id))
+        
+        if not source_dir.exists():
+            return []
+        
+        all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+        files = []
+        for f in source_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            if f.name in DEFAULT_EXCLUDED_FILE_NAMES:
+                continue
+            if any(part in IGNORE_DIRS for part in f.parts):
+                continue
+            if f.suffix.lower() not in all_extensions:
+                continue
+            files.append({
+                "filename": f.name,
+                "path": str(f),
+                "size": f.stat().st_size,
+            })
+        return files
+
+    def delete_uploaded_file(self, kb_id: str, filename: str) -> bool:
+        file_path = Path(self._get_kb_upload_dir(kb_id)) / secure_filename(filename)
+        if file_path.exists() and file_path.is_file():
+            file_path.unlink()
+            return True
+        return False
 
     def build_index(
         self,
         source: str,
         index_path: str,
+        kb_id: str = "default",
         chunks_dir: str = DEFAULT_CHUNKS_DIR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
@@ -476,12 +651,27 @@ class KnowledgeBaseService:
         count = kb.build(source)
         kb.save(index_path)
         kb.save_chunks_to_files(source, chunks_dir)
+        
+        bases = self._load_kb_meta()
+        for base in bases:
+            if base.id == kb_id:
+                base.chunk_count = count
+                if kb_id == "default":
+                    base.document_count = len(self.list_uploaded_files(kb_id))
+                else:
+                    upload_dir = Path(self._get_kb_upload_dir(kb_id))
+                    base.document_count = len(list(upload_dir.glob("*"))) if upload_dir.exists() else 0
+                break
+        self._save_kb_meta(bases)
+        
         with self._lock:
             self.kb = kb
             self.loaded_index_path = index_path
+            self.loaded_kb_id = kb_id
         return {
             "source": source,
             "index": index_path,
+            "kb_id": kb_id,
             "chunks_dir": chunks_dir,
             "chunks": count,
             "chunk_size": chunk_size,
@@ -492,6 +682,7 @@ class KnowledgeBaseService:
         self,
         source: str,
         index_path: str,
+        kb_id: str = "default",
         chunks_dir: str = DEFAULT_CHUNKS_DIR,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
@@ -514,6 +705,7 @@ class KnowledgeBaseService:
                 status="queued",
                 source=source,
                 index_path=index_path,
+                kb_id=kb_id,
                 chunks_dir=chunks_dir,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
@@ -535,6 +727,7 @@ class KnowledgeBaseService:
             result = self.build_index(
                 source=job.source,
                 index_path=job.index_path,
+                kb_id=job.kb_id,
                 chunks_dir=job.chunks_dir,
                 chunk_size=job.chunk_size,
                 chunk_overlap=job.chunk_overlap,
@@ -604,37 +797,61 @@ class KnowledgeBaseService:
                 if current_event is not None:
                     current_event.set()
 
-    def start_warmup(self, index_path: str = DEFAULT_INDEX_PATH, source_dir: str = DEFAULT_SOURCE_DIR, chunks_dir: str = DEFAULT_CHUNKS_DIR) -> None:
+    def start_warmup(self, kb_id: str = "default") -> None:
         with self._lock:
             if self.warmup_started:
                 return
             self.warmup_started = True
 
-        Thread(target=self._warmup_index, args=(index_path, source_dir, chunks_dir), daemon=True).start()
+        Thread(target=self._warmup_index, args=(kb_id,), daemon=True).start()
 
-    def _warmup_index(self, index_path: str, source_dir: str, chunks_dir: str) -> None:
+    def _warmup_index(self, kb_id: str) -> None:
         try:
+            index_path = self._get_kb_index_path(kb_id)
+            
+            if kb_id == "default":
+                source_dir = DEFAULT_SOURCE_DIR
+            else:
+                source_dir = self._get_kb_upload_dir(kb_id)
+            
             if Path(index_path).exists():
                 self.ensure_loaded(index_path)
+                with self._lock:
+                    self.loaded_kb_id = kb_id
                 print(f"[预热] 已加载现有索引: {index_path}")
-            else:
-                print(f"[预热] 索引文件不存在，开始自动构建索引...")
-                print(f"[预热] 扫描目录: {source_dir}")
-                result = self.build_index(
-                    source=source_dir,
-                    index_path=index_path,
-                    chunks_dir=chunks_dir,
+            elif Path(source_dir).exists():
+                all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+                has_files = any(
+                    f.suffix.lower() in all_extensions
+                    for f in Path(source_dir).rglob("*")
+                    if f.is_file() and f.name not in DEFAULT_EXCLUDED_FILE_NAMES
+                    and not any(part in IGNORE_DIRS for part in f.parts)
                 )
-                print(f"[预热] 索引构建完成：共 {result['chunks']} 个分片，已保存到 {result['index']}")
-                print(f"[预热] 分片文件已保存到: {result['chunks_dir']}")
+                if has_files:
+                    print(f"[预热] 索引文件不存在，开始自动构建索引...")
+                    print(f"[预热] 扫描目录: {source_dir}")
+                    result = self.build_index(
+                        source=source_dir,
+                        index_path=index_path,
+                        kb_id=kb_id,
+                        chunks_dir=self._get_kb_chunks_dir(kb_id),
+                    )
+                    print(f"[预热] 索引构建完成：共 {result['chunks']} 个分片")
+                else:
+                    print(f"[预热] 知识库 {kb_id} 暂无文件，跳过构建")
+            else:
+                print(f"[预热] 知识库 {kb_id} 目录不存在，跳过构建")
         except Exception as error:
             with self._lock:
                 self.warmup_error = str(error)
             print(f"[预热] 错误: {error}")
 
-    def ask(self, question: str, index_path: str, top_k: int = DEFAULT_TOP_K) -> dict:
+    def ask(self, question: str, kb_id: str = "default", top_k: int = DEFAULT_TOP_K) -> dict:
         load_dotenv()
+        index_path = self._get_kb_index_path(kb_id)
         kb = self.ensure_loaded(index_path)
+        with self._lock:
+            self.loaded_kb_id = kb_id
         results = kb.search(question, top_k=top_k)
         if not results:
             return {
@@ -653,14 +870,24 @@ class KnowledgeBaseService:
             "results": results,
         }
 
-    def status(self, index_path: str = DEFAULT_INDEX_PATH) -> dict:
+    def status(self, kb_id: str = "default") -> dict:
+        index_path = self._get_kb_index_path(kb_id)
         index_file = Path(index_path)
         index_exists = index_file.exists()
-        loaded = self.kb is not None and self.loaded_index_path == index_path
+        loaded = self.kb is not None and self.loaded_kb_id == kb_id
         document_count = len(self.kb.documents) if loaded and self.kb is not None else 0
+        
+        bases = self._load_kb_meta()
+        kb_info = None
+        for kb in bases:
+            if kb.id == kb_id:
+                kb_info = kb.to_dict()
+                break
+        
         active_job = self.build_jobs.get(self.active_build_job_id or "")
         warming_up = index_path in self.loading_indexes
         return {
+            "kb_id": kb_id,
             "index_exists": index_exists,
             "index_path": index_path,
             "loaded": loaded,
@@ -668,7 +895,8 @@ class KnowledgeBaseService:
             "api_key_configured": bool(os.getenv("DASHSCOPE_API_KEY")),
             "build_job": active_job.to_dict() if active_job else None,
             "warming_up": warming_up,
-            "warmup_error": self.warmup_error if index_path == DEFAULT_INDEX_PATH else None,
+            "warmup_error": self.warmup_error if kb_id == "default" else None,
+            "kb_info": kb_info,
         }
 
 
@@ -682,8 +910,8 @@ def get_env(name: str, default: str | None = None) -> str:
 service = KnowledgeBaseService()
 service.start_warmup()
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
-# 支持 Render 部署：读取 PORT 环境变量
 port = int(os.getenv('PORT', 7860))
 
 
@@ -702,26 +930,87 @@ def chrome_devtools_manifest() -> Response:
     return Response(status=204)
 
 
+@app.get("/api/kb/list")
+def api_kb_list():
+    return jsonify(service.list_knowledge_bases())
+
+
+@app.post("/api/kb/create")
+def api_kb_create():
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    description = (payload.get("description") or "").strip()
+    
+    if not name:
+        return jsonify({"error": "知识库名称不能为空"}), 400
+    
+    result = service.create_knowledge_base(name=name, description=description)
+    return jsonify(result), 201
+
+
+@app.delete("/api/kb/<kb_id>")
+def api_kb_delete(kb_id: str):
+    try:
+        service.delete_knowledge_base(kb_id)
+        return jsonify({"success": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.get("/api/kb/<kb_id>/files")
+def api_kb_files(kb_id: str):
+    files = service.list_uploaded_files(kb_id)
+    return jsonify(files)
+
+
+@app.post("/api/kb/<kb_id>/upload")
+def api_kb_upload(kb_id: str):
+    if 'file' not in request.files:
+        return jsonify({"error": "没有上传文件"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "没有选择文件"}), 400
+    
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": f"不支持的文件格式: {ext}"}), 400
+    
+    result = service.upload_file(kb_id, file)
+    return jsonify(result), 201
+
+
+@app.delete("/api/kb/<kb_id>/files/<filename>")
+def api_kb_file_delete(kb_id: str, filename: str):
+    success = service.delete_uploaded_file(kb_id, filename)
+    if success:
+        return jsonify({"success": True})
+    return jsonify({"error": "文件不存在"}), 404
+
+
 @app.get("/api/status")
 def api_status():
     load_dotenv()
-    index_path = request.args.get("index", DEFAULT_INDEX_PATH)
-    return jsonify(service.status(index_path=index_path))
+    kb_id = request.args.get("kb_id", "default")
+    return jsonify(service.status(kb_id=kb_id))
 
 
 @app.post("/api/build")
 def api_build():
     load_dotenv()
     payload = request.get_json(silent=True) or {}
-    source = payload.get("source", DEFAULT_SOURCE_DIR)
-    index_path = payload.get("index", DEFAULT_INDEX_PATH)
-    chunks_dir = payload.get("chunks_dir", DEFAULT_CHUNKS_DIR)
+    kb_id = payload.get("kb_id", "default")
     chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
     chunk_overlap = int(payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
+    upload_dir = service._get_kb_upload_dir(kb_id)
+    index_path = service._get_kb_index_path(kb_id)
+    chunks_dir = service._get_kb_chunks_dir(kb_id)
+
     result = service.start_build_index(
-        source=source,
+        source=upload_dir,
         index_path=index_path,
+        kb_id=kb_id,
         chunks_dir=chunks_dir,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -742,13 +1031,13 @@ def api_ask():
     load_dotenv()
     payload = request.get_json(silent=True) or {}
     question = (payload.get("question") or "").strip()
-    index_path = payload.get("index", DEFAULT_INDEX_PATH)
+    kb_id = payload.get("kb_id", "default")
     top_k = int(payload.get("top_k", DEFAULT_TOP_K))
 
     if not question:
         return jsonify({"error": "问题不能为空"}), 400
 
-    result = service.ask(question=question, index_path=index_path, top_k=top_k)
+    result = service.ask(question=question, kb_id=kb_id, top_k=top_k)
     return jsonify(result)
 
 

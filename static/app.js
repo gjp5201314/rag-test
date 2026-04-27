@@ -1,5 +1,5 @@
 const statusBadge = document.getElementById('statusBadge');
-const indexPathEl = document.getElementById('indexPath');
+const currentKbNameEl = document.getElementById('currentKbName');
 const loadedStateEl = document.getElementById('loadedState');
 const documentCountEl = document.getElementById('documentCount');
 const apiStateEl = document.getElementById('apiState');
@@ -8,10 +8,28 @@ const answerMetaEl = document.getElementById('answerMeta');
 const answerContentEl = document.getElementById('answerContent');
 const answerBlockEl = document.getElementById('answerBlock');
 const resultsListEl = document.getElementById('resultsList');
-const buildForm = document.getElementById('buildForm');
 const askForm = document.getElementById('askForm');
 const refreshStatusBtn = document.getElementById('refreshStatusBtn');
 
+const kbTabsEl = document.getElementById('kbTabs');
+const askKbTabsEl = document.getElementById('askKbTabs');
+const createKbBtn = document.getElementById('createKbBtn');
+const deleteKbBtn = document.getElementById('deleteKbBtn');
+const createKbForm = document.getElementById('createKbForm');
+const newKbNameInput = document.getElementById('newKbName');
+const newKbDescInput = document.getElementById('newKbDesc');
+const confirmCreateKb = document.getElementById('confirmCreateKb');
+const cancelCreateKb = document.getElementById('cancelCreateKb');
+const currentKbTitleEl = document.getElementById('currentKbTitle');
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const fileListEl = document.getElementById('fileList');
+const buildBtn = document.getElementById('buildBtn');
+const chunkSizeInput = document.getElementById('chunkSize');
+const chunkOverlapInput = document.getElementById('chunkOverlap');
+
+let currentKbId = 'default';
+let askKbId = 'default';
 let activeBuildJobId = null;
 let activeBuildPollPromise = null;
 
@@ -88,6 +106,80 @@ function renderResults(results) {
     .join('');
 }
 
+function renderFileList(files) {
+  if (!files || files.length === 0) {
+    fileListEl.innerHTML = '<div class="empty-state">暂无上传文件</div>';
+    return;
+  }
+
+  fileListEl.innerHTML = files
+    .map(
+      (file) => `
+        <div class="file-item">
+          <span class="file-name">${escapeHtml(file.filename)}</span>
+          <span class="file-size">${(file.size / 1024).toFixed(1)} KB</span>
+          <button class="delete-file-btn" data-filename="${escapeHtml(file.filename)}">删除</button>
+        </div>
+      `,
+    )
+    .join('');
+
+  fileListEl.querySelectorAll('.delete-file-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const filename = btn.dataset.filename;
+      if (confirm(`确定删除文件 "${filename}"？`)) {
+        try {
+          await requestJson(`/api/kb/${currentKbId}/files/${encodeURIComponent(filename)}`, {
+            method: 'DELETE',
+          });
+          await loadFiles();
+        } catch (error) {
+          alert(`删除失败：${error.message}`);
+        }
+      }
+    });
+  });
+}
+
+function renderKbTabs(bases) {
+  kbTabsEl.innerHTML = bases
+    .map(
+      (kb) => `
+        <button type="button" class="kb-tab ${kb.id === currentKbId ? 'active' : ''}" data-kb-id="${escapeHtml(kb.id)}">
+          <span class="kb-tab-name">${escapeHtml(kb.name)}</span>
+          <span class="kb-tab-count">${kb.chunk_count} 分片</span>
+        </button>
+      `,
+    )
+    .join('');
+
+  askKbTabsEl.innerHTML = bases
+    .map(
+      (kb) => `
+        <button type="button" class="kb-tab ${kb.id === askKbId ? 'active' : ''}" data-kb-id="${escapeHtml(kb.id)}">
+          <span class="kb-tab-name">${escapeHtml(kb.name)}</span>
+        </button>
+      `,
+    )
+    .join('');
+
+  kbTabsEl.querySelectorAll('.kb-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      currentKbId = tab.dataset.kbId;
+      renderKbTabs(bases);
+      loadStatus();
+      loadFiles();
+    });
+  });
+
+  askKbTabsEl.querySelectorAll('.kb-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      askKbId = tab.dataset.kbId;
+      renderKbTabs(bases);
+    });
+  });
+}
+
 async function pollBuildJob(jobId) {
   if (activeBuildJobId === jobId && activeBuildPollPromise) {
     return activeBuildPollPromise;
@@ -126,10 +218,19 @@ async function pollBuildJob(jobId) {
 }
 
 function updateStatusView(data) {
-  indexPathEl.textContent = data.index_path || './data/index.json';
+  currentKbNameEl.textContent = data.kb_info?.name || currentKbId;
   loadedStateEl.textContent = data.loaded ? '已加载' : '未加载';
   documentCountEl.textContent = String(data.document_count ?? 0);
   apiStateEl.textContent = data.api_key_configured ? '已配置' : '未配置';
+
+  if (data.kb_info) {
+    currentKbTitleEl.textContent = data.kb_info.name;
+    if (data.kb_info.id === 'default') {
+      deleteKbBtn.classList.add('hidden');
+    } else {
+      deleteKbBtn.classList.remove('hidden');
+    }
+  }
 
   if (data.build_job && ['queued', 'running'].includes(data.build_job.status)) {
     setStatusBadge('构建中', 'warn');
@@ -138,11 +239,9 @@ function updateStatusView(data) {
     }
     if (activeBuildJobId !== data.build_job.job_id) {
       pollBuildJob(data.build_job.job_id)
-        .then(async (job) => {
-          const result = job.result || {};
-          const targetIndex = result.index || data.build_job.index || data.index_path || './data/index.json';
-          askForm.elements.index.value = targetIndex;
-          await loadStatus(targetIndex);
+        .then(async () => {
+          await loadStatus();
+          await loadKbList();
         })
         .catch((error) => {
           setBuildMessage(`构建失败：${error.message}`);
@@ -167,9 +266,9 @@ function updateStatusView(data) {
   }
 }
 
-async function loadStatus(indexPath = './data/index.json') {
+async function loadStatus() {
   try {
-    const data = await requestJson(`/api/status?index=${encodeURIComponent(indexPath)}`);
+    const data = await requestJson(`/api/status?kb_id=${encodeURIComponent(currentKbId)}`);
     updateStatusView(data);
   } catch (error) {
     setStatusBadge('异常', 'error');
@@ -177,24 +276,134 @@ async function loadStatus(indexPath = './data/index.json') {
   }
 }
 
-buildForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const formData = new FormData(buildForm);
-  const payload = Object.fromEntries(formData.entries());
-  const submitButton = buildForm.querySelector('button[type="submit"]');
-  const targetIndex = payload.index || './data/index.json';
+async function loadKbList() {
+  try {
+    const bases = await requestJson('/api/kb/list');
+    renderKbTabs(bases);
+  } catch (error) {
+    console.error('加载知识库列表失败:', error);
+  }
+}
 
-  askForm.elements.index.value = targetIndex;
+async function loadFiles() {
+  try {
+    const files = await requestJson(`/api/kb/${currentKbId}/files`);
+    renderFileList(files);
+  } catch (error) {
+    fileListEl.innerHTML = '<div class="empty-state">加载文件列表失败</div>';
+  }
+}
+
+createKbBtn.addEventListener('click', () => {
+  createKbForm.classList.remove('hidden');
+  newKbNameInput.focus();
+});
+
+cancelCreateKb.addEventListener('click', () => {
+  createKbForm.classList.add('hidden');
+  newKbNameInput.value = '';
+  newKbDescInput.value = '';
+});
+
+confirmCreateKb.addEventListener('click', async () => {
+  const name = newKbNameInput.value.trim();
+  const description = newKbDescInput.value.trim();
+
+  if (!name) {
+    alert('请输入知识库名称');
+    return;
+  }
+
+  try {
+    const kb = await requestJson('/api/kb/create', {
+      method: 'POST',
+      body: JSON.stringify({ name, description }),
+    });
+
+    createKbForm.classList.add('hidden');
+    newKbNameInput.value = '';
+    newKbDescInput.value = '';
+
+    await loadKbList();
+    currentKbId = kb.id;
+    await loadStatus();
+    await loadFiles();
+  } catch (error) {
+    alert(`创建失败：${error.message}`);
+  }
+});
+
+deleteKbBtn.addEventListener('click', async () => {
+  if (currentKbId === 'default') {
+    alert('不能删除默认知识库');
+    return;
+  }
+
+  const kbName = currentKbTitleEl.textContent;
+  if (!confirm(`确定删除知识库 "${kbName}"？`)) {
+    return;
+  }
+
+  try {
+    await requestJson(`/api/kb/${currentKbId}`, { method: 'DELETE' });
+    currentKbId = 'default';
+    await loadKbList();
+    await loadStatus();
+    await loadFiles();
+  } catch (error) {
+    alert(`删除失败：${error.message}`);
+  }
+});
+
+uploadBtn.addEventListener('click', async () => {
+  const files = fileInput.files;
+  if (!files || files.length === 0) {
+    alert('请选择要上传的文件');
+    return;
+  }
+
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append('file', file);
+  }
+
+  try {
+    setBuildMessage('正在上传文件...', true);
+
+    const response = await fetch(`/api/kb/${currentKbId}/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || '上传失败');
+    }
+
+    setBuildMessage(`文件上传成功`, true);
+    fileInput.value = '';
+    await loadFiles();
+  } catch (error) {
+    setBuildMessage(`上传失败：${error.message}`);
+  }
+});
+
+buildBtn.addEventListener('click', async () => {
+  const chunkSize = parseInt(chunkSizeInput.value, 10) || 1000;
+  const chunkOverlap = parseInt(chunkOverlapInput.value, 10) || 200;
+
   setStatusBadge('构建中', 'warn');
   setBuildMessage('正在提交构建任务，请稍候...', true);
-  if (submitButton) {
-    submitButton.disabled = true;
-  }
+  buildBtn.disabled = true;
 
   try {
     const data = await requestJson('/api/build', {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        kb_id: currentKbId,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+      }),
     });
 
     const jobId = data.job_id;
@@ -203,19 +412,14 @@ buildForm.addEventListener('submit', async (event) => {
     }
 
     const job = await pollBuildJob(jobId);
-    const result = job.result || {};
-    const builtIndex = result.index || targetIndex;
-
-    setBuildMessage(job.message || `索引构建完成：共 ${result.chunks ?? 0} 个分片，索引文件为 ${builtIndex}`);
-    askForm.elements.index.value = builtIndex;
-    await loadStatus(builtIndex);
+    setBuildMessage(job.message || '索引构建完成');
+    await loadStatus();
+    await loadKbList();
   } catch (error) {
     setBuildMessage(`构建失败：${error.message}`);
     setStatusBadge('异常', 'error');
   } finally {
-    if (submitButton) {
-      submitButton.disabled = false;
-    }
+    buildBtn.disabled = false;
   }
 });
 
@@ -223,6 +427,7 @@ askForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const formData = new FormData(askForm);
   const payload = Object.fromEntries(formData.entries());
+  payload.kb_id = askKbId;
 
   answerBlockEl.classList.remove('empty');
   answerMetaEl.textContent = '检索中';
@@ -237,7 +442,7 @@ askForm.addEventListener('submit', async (event) => {
     answerMetaEl.textContent = `已命中 ${data.results.length} 个分片`;
     answerContentEl.textContent = data.answer;
     renderResults(data.results);
-    await loadStatus(payload.index || './data/index.json');
+    await loadStatus();
   } catch (error) {
     answerMetaEl.textContent = '请求失败';
     answerContentEl.textContent = error.message;
@@ -247,8 +452,10 @@ askForm.addEventListener('submit', async (event) => {
 });
 
 refreshStatusBtn.addEventListener('click', () => {
-  const currentIndex = askForm.elements.index.value || './data/index.json';
-  loadStatus(currentIndex);
+  loadStatus();
+  loadKbList();
 });
 
+loadKbList();
 loadStatus();
+loadFiles();

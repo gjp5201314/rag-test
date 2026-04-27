@@ -18,7 +18,7 @@
         <h1>本地知识库控制台</h1>
         <p class="lead">
           将你的本地文档目录编织成一个可检索、可追问、可落地使用的知识界面。
-          先构建索引，再在右侧窗口直接提问。
+          选择知识库，上传文件，构建索引，然后开始提问。
         </p>
       </div>
 
@@ -29,11 +29,11 @@
         </div>
         <dl class="status-grid">
           <div>
-            <dt>索引文件</dt>
-            <dd id="indexPath">./data/index.json</dd>
+            <dt>当前知识库</dt>
+            <dd id="currentKbName">-</dd>
           </div>
           <div>
-            <dt>已加载</dt>
+            <dt>索引状态</dt>
             <dd id="loadedState">-</dd>
           </div>
           <div>
@@ -52,35 +52,74 @@
       <article class="panel form-panel">
         <div class="panel-head">
           <p class="kicker">STEP 1</p>
-          <h2>建立索引</h2>
+          <h2>知识库管理</h2>
         </div>
 
-        <form id="buildForm" class="stack-form">
-          <label>
-            <span>文档目录</span>
-            <input type="text" name="source" value="./data" placeholder="例如：./data" />
-          </label>
+        <div class="kb-tabs-section">
+          <div class="kb-tabs-header">
+            <span class="kb-tabs-label">选择知识库</span>
+            <div class="kb-tabs-actions">
+              <button type="button" id="createKbBtn" class="ghost-btn small">+ 新建</button>
+            </div>
+          </div>
+          <div id="kbTabs" class="kb-tabs">
+            <button type="button" class="kb-tab active" data-kb-id="default">
+              <span class="kb-tab-name">默认知识库</span>
+              <span class="kb-tab-count">0 分片</span>
+            </button>
+          </div>
+        </div>
 
+        <div id="createKbForm" class="create-kb-form hidden">
           <label>
-            <span>索引文件</span>
-            <input type="text" name="index" value="./data/index.json" placeholder="例如：./data/index.json" />
+            <span>知识库名称</span>
+            <input type="text" id="newKbName" placeholder="输入知识库名称" />
           </label>
+          <label>
+            <span>描述（可选）</span>
+            <input type="text" id="newKbDesc" placeholder="输入描述" />
+          </label>
+          <div class="form-actions">
+            <button type="button" id="confirmCreateKb" class="action-btn primary">创建</button>
+            <button type="button" id="cancelCreateKb" class="ghost-btn">取消</button>
+          </div>
+        </div>
 
-          <div class="two-col">
-            <label>
-              <span>分片长度</span>
-              <input type="number" name="chunk_size" value="1000" min="100" step="50" />
+        <div class="kb-detail-section">
+          <div class="kb-detail-header">
+            <h3 id="currentKbTitle">默认知识库</h3>
+            <button type="button" id="deleteKbBtn" class="ghost-btn small danger hidden">删除知识库</button>
+          </div>
+          
+          <div class="upload-section">
+            <label class="upload-label">
+              <span>上传文件</span>
+              <input type="file" id="fileInput" multiple accept=".txt,.md,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.py,.js,.json,.yaml,.yml,.csv,.html,.css" />
+              <div class="upload-hint">支持: txt, md, pdf, docx, doc, pptx, ppt, xlsx, xls, py, js, json, yaml, csv, html, css</div>
             </label>
-            <label>
-              <span>重叠长度</span>
-              <input type="number" name="chunk_overlap" value="200" min="0" step="10" />
-            </label>
+            <button type="button" id="uploadBtn" class="action-btn">上传文件</button>
           </div>
 
-          <button type="submit" class="action-btn primary">构建本地索引</button>
-        </form>
+          <div id="fileList" class="file-list">
+            <div class="empty-state">暂无上传文件</div>
+          </div>
 
-        <div id="buildMessage" class="message-card muted">等待建立索引。</div>
+          <div class="build-section">
+            <div class="two-col">
+              <label>
+                <span>分片长度</span>
+                <input type="number" id="chunkSize" value="1000" min="100" step="50" />
+              </label>
+              <label>
+                <span>重叠长度</span>
+                <input type="number" id="chunkOverlap" value="200" min="0" step="10" />
+              </label>
+            </div>
+            <button type="button" id="buildBtn" class="action-btn primary">构建索引</button>
+          </div>
+
+          <div id="buildMessage" class="message-card muted">等待操作。</div>
+        </div>
       </article>
 
       <article class="panel qa-panel">
@@ -95,11 +134,16 @@
             <textarea name="question" rows="5" placeholder="例如：这个项目是如何检索本地文件并调用千问生成回答的？"></textarea>
           </label>
 
+          <div class="ask-kb-section">
+            <span class="kb-tabs-label">选择知识库</span>
+            <div id="askKbTabs" class="kb-tabs small">
+              <button type="button" class="kb-tab active" data-kb-id="default">
+                <span class="kb-tab-name">默认知识库</span>
+              </button>
+            </div>
+          </div>
+
           <div class="two-col">
-            <label>
-              <span>索引文件</span>
-              <input type="text" name="index" value="./data/index.json" />
-            </label>
             <label>
               <span>Top-K</span>
               <input type="number" name="top_k" value="5" min="1" max="20" />
