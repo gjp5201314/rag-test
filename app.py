@@ -66,6 +66,36 @@ DEFAULT_QWEN_MODEL = "qwen-plus"
 DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
+def get_vectorizer_cache_path(index_path: str) -> str:
+    """获取向量化器缓存文件路径"""
+    base = Path(index_path)
+    return str(base.parent / f"{base.stem}_vectorizer.joblib")
+
+
+def get_matrix_cache_path(index_path: str) -> str:
+    """获取矩阵缓存文件路径"""
+    base = Path(index_path)
+    return str(base.parent / f"{base.stem}_matrix.npz")
+
+
+def joblib_dump(obj, file_path: str, compress: int = 3) -> None:
+    """使用 joblib 保存对象"""
+    import joblib
+    joblib.dump(obj, file_path, compress=compress)
+
+
+def save_npz(file_path: str, matrix, compressed: bool = True) -> None:
+    """保存 numpy 矩阵为 npz 格式"""
+    import numpy as np
+    if matrix is None:
+        np.savez_compressed(file_path) if compressed else np.savez(file_path)
+        return
+    if compressed:
+        np.savez_compressed(file_path, data=matrix)
+    else:
+        np.savez(file_path, data=matrix)
+
+
 @dataclass
 class DocumentChunk:
     path: str
@@ -104,6 +134,8 @@ class LocalKnowledgeBase:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.documents: List[DocumentChunk] = []
+        self.vectorizer = None
+        self.matrix = None
 
     def build(self, root_dir: str) -> int:
         self.documents = list(self._load_documents(root_dir))
@@ -529,6 +561,12 @@ def get_env(name: str, default: str | None = None) -> str:
 service = KnowledgeBaseService()
 service.start_warmup()
 app = Flask(__name__)
+
+# 支持 Render 部署：读取 PORT 环境变量
+port = int(os.getenv('PORT', 7860))
+if __name__ == '__main__':
+    # 在生产环境中，监听 0.0.0.0 以接受外部请求
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 
 @app.get("/")
