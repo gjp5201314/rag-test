@@ -307,6 +307,7 @@ class LocalKnowledgeBase:
             raise FileNotFoundError(f"目录不存在: {root_dir}")
 
         all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+        skipped_files = []
 
         for file_path in root.rglob("*"):
             if not file_path.is_file():
@@ -320,11 +321,15 @@ class LocalKnowledgeBase:
 
             text = self._read_text_file(file_path)
             if not text.strip():
+                skipped_files.append(str(file_path))
                 continue
 
             relative_path = str(file_path.relative_to(root))
             for chunk_id, chunk_text in enumerate(self._split_text(text)):
                 yield DocumentChunk(path=relative_path, chunk_id=chunk_id, text=chunk_text)
+
+        if skipped_files:
+            print(f"[警告] 以下文件无法读取内容，已跳过: {skipped_files}")
 
     def _read_text_file(self, file_path: Path) -> str:
         suffix = file_path.suffix.lower()
@@ -597,27 +602,30 @@ class KnowledgeBaseService:
     def upload_file(self, kb_id: str, file) -> dict:
         upload_dir = Path(self._get_kb_upload_dir(kb_id))
         upload_dir.mkdir(parents=True, exist_ok=True)
-        
+
         original_filename = file.filename
-        
-        safe_name = secure_filename(original_filename)
-        if not safe_name or safe_name.strip() == "":
-            name_part = original_filename.rsplit(".", 1)[0] if "." in original_filename else original_filename
-            ext_part = original_filename.rsplit(".", 1)[-1] if "." in original_filename else ""
-            safe_name = f"{name_part}.{ext_part}" if ext_part else name_part
-        
-        safe_name = "".join(c for c in safe_name if c not in r'<>:"/\|?*')
-        
+
+        name_part = original_filename.rsplit(".", 1)[0] if "." in original_filename else original_filename
+        ext_part = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else ""
+
+        safe_name = "".join(c for c in name_part if c not in r'<>:"/\|?*')
+        if not safe_name.strip():
+            safe_name = "unnamed"
+
+        if ext_part:
+            safe_name = f"{safe_name}.{ext_part}"
+
         file_path = upload_dir / safe_name
         counter = 1
         while file_path.exists():
-            name = file_path.stem
-            ext = file_path.suffix
-            file_path = upload_dir / f"{name}_{counter}{ext}"
+            name = Path(safe_name).stem
+            ext = Path(safe_name).suffix
+            safe_name = f"{name}_{counter}{ext}"
+            file_path = upload_dir / safe_name
             counter += 1
-        
+
         file.save(str(file_path))
-        
+
         return {
             "filename": safe_name,
             "path": str(file_path),
@@ -625,22 +633,17 @@ class KnowledgeBaseService:
         }
 
     def list_uploaded_files(self, kb_id: str) -> List[dict]:
-        if kb_id == "default":
-            source_dir = Path(DEFAULT_SOURCE_DIR)
-        else:
-            source_dir = Path(self._get_kb_upload_dir(kb_id))
-        
+        source_dir = Path(self._get_kb_upload_dir(kb_id))
+
         if not source_dir.exists():
             return []
-        
+
         all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
         files = []
-        for f in source_dir.rglob("*"):
+        for f in source_dir.glob("*"):
             if not f.is_file():
                 continue
             if f.name in DEFAULT_EXCLUDED_FILE_NAMES:
-                continue
-            if any(part in IGNORE_DIRS for part in f.parts):
                 continue
             if f.suffix.lower() not in all_extensions:
                 continue
@@ -676,11 +679,7 @@ class KnowledgeBaseService:
         for base in bases:
             if base.id == kb_id:
                 base.chunk_count = count
-                if kb_id == "default":
-                    base.document_count = len(self.list_uploaded_files(kb_id))
-                else:
-                    upload_dir = Path(self._get_kb_upload_dir(kb_id))
-                    base.document_count = len(list(upload_dir.glob("*"))) if upload_dir.exists() else 0
+                base.document_count = len(self.list_uploaded_files(kb_id))
                 break
         self._save_kb_meta(bases)
         
@@ -829,10 +828,7 @@ class KnowledgeBaseService:
         try:
             index_path = self._get_kb_index_path(kb_id)
             
-            if kb_id == "default":
-                source_dir = DEFAULT_SOURCE_DIR
-            else:
-                source_dir = self._get_kb_upload_dir(kb_id)
+            source_dir = self._get_kb_upload_dir(kb_id)
             
             if Path(index_path).exists():
                 self.ensure_loaded(index_path)
@@ -1023,14 +1019,9 @@ def api_build():
     chunk_size = int(payload.get("chunk_size", DEFAULT_CHUNK_SIZE))
     chunk_overlap = int(payload.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP))
 
-    if kb_id == "default":
-        source_dir = DEFAULT_SOURCE_DIR
-        index_path = DEFAULT_INDEX_PATH
-        chunks_dir = DEFAULT_CHUNKS_DIR
-    else:
-        source_dir = service._get_kb_upload_dir(kb_id)
-        index_path = service._get_kb_index_path(kb_id)
-        chunks_dir = service._get_kb_chunks_dir(kb_id)
+    source_dir = service._get_kb_upload_dir(kb_id)
+    index_path = service._get_kb_index_path(kb_id)
+    chunks_dir = service._get_kb_chunks_dir(kb_id)
 
     result = service.start_build_index(
         source=source_dir,

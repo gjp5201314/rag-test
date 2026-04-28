@@ -1,0 +1,11 @@
+{
+  "chunk_size": 1000,
+  "chunk_overlap": 200,
+  "documents": [
+    {
+      "path": "测试说明.md",
+      "chunk_id": 0,
+      "text": "# 测试文件\n\n这是一个测试文件的内容。"
+    }
+  ]
+}
