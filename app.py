@@ -181,11 +181,43 @@ class LocalKnowledgeBase:
         self.vectorizer = None
         self.matrix = None
 
-    def build(self, root_dir: str) -> int:
-        self.documents = list(self._load_documents(root_dir))
+    def build(self, root_dir: str) -> tuple[int, list[str]]:
+        skipped_files: list[str] = []
+        documents: List[DocumentChunk] = []
+
+        for doc, skipped in self._load_documents(root_dir, skipped_files):
+            documents.append(doc)
+
+        self.documents = documents
         if not self.documents:
             raise ValueError(f"在目录 {root_dir} 中没有找到可索引的文本文件。")
-        return len(self.documents)
+        return len(self.documents), skipped_files
+
+    def _load_documents(self, root_dir: str, skipped_files: list[str]) -> Iterable[tuple[DocumentChunk, bool]]:
+        root = Path(root_dir)
+        if not root.exists():
+            raise FileNotFoundError(f"目录不存在: {root_dir}")
+
+        all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
+
+        for file_path in root.rglob("*"):
+            if not file_path.is_file():
+                continue
+            if any(part in IGNORE_DIRS for part in file_path.parts):
+                continue
+            if file_path.name in DEFAULT_EXCLUDED_FILE_NAMES:
+                continue
+            if file_path.suffix.lower() not in all_extensions:
+                continue
+
+            text = self._read_text_file(file_path)
+            if not text.strip():
+                skipped_files.append(str(file_path))
+                continue
+
+            relative_path = str(file_path.relative_to(root))
+            for chunk_id, chunk_text in enumerate(self._split_text(text)):
+                yield DocumentChunk(path=relative_path, chunk_id=chunk_id, text=chunk_text), False
 
     def save(self, index_path: str) -> None:
         if not self.documents:
@@ -300,36 +332,6 @@ class LocalKnowledgeBase:
 
     def _normalize_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", text.lower()).strip()
-
-    def _load_documents(self, root_dir: str) -> Iterable[DocumentChunk]:
-        root = Path(root_dir)
-        if not root.exists():
-            raise FileNotFoundError(f"目录不存在: {root_dir}")
-
-        all_extensions = DOCUMENT_EXTENSIONS | OFFICE_EXTENSIONS
-        skipped_files = []
-
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(part in IGNORE_DIRS for part in file_path.parts):
-                continue
-            if file_path.name in DEFAULT_EXCLUDED_FILE_NAMES:
-                continue
-            if file_path.suffix.lower() not in all_extensions:
-                continue
-
-            text = self._read_text_file(file_path)
-            if not text.strip():
-                skipped_files.append(str(file_path))
-                continue
-
-            relative_path = str(file_path.relative_to(root))
-            for chunk_id, chunk_text in enumerate(self._split_text(text)):
-                yield DocumentChunk(path=relative_path, chunk_id=chunk_id, text=chunk_text)
-
-        if skipped_files:
-            print(f"[警告] 以下文件无法读取内容，已跳过: {skipped_files}")
 
     def _read_text_file(self, file_path: Path) -> str:
         suffix = file_path.suffix.lower()
@@ -671,10 +673,10 @@ class KnowledgeBaseService:
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> dict:
         kb = LocalKnowledgeBase(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        count = kb.build(source)
+        count, skipped_files = kb.build(source)
         kb.save(index_path)
         kb.save_chunks_to_files(source, chunks_dir)
-        
+
         bases = self._load_kb_meta()
         for base in bases:
             if base.id == kb_id:
@@ -682,12 +684,13 @@ class KnowledgeBaseService:
                 base.document_count = len(self.list_uploaded_files(kb_id))
                 break
         self._save_kb_meta(bases)
-        
+
         with self._lock:
             self.kb = kb
             self.loaded_index_path = index_path
             self.loaded_kb_id = kb_id
-        return {
+
+        result = {
             "source": source,
             "index": index_path,
             "kb_id": kb_id,
@@ -696,6 +699,12 @@ class KnowledgeBaseService:
             "chunk_size": chunk_size,
             "chunk_overlap": chunk_overlap,
         }
+
+        if skipped_files:
+            result["skipped_files"] = skipped_files
+            print(f"[警告] 以下文件无法读取内容，已跳过: {skipped_files}")
+
+        return result
 
     def start_build_index(
         self,
@@ -1085,6 +1094,8 @@ def build_command(args: argparse.Namespace) -> None:
     print(
         f"已建立索引，共 {result['chunks']} 个文本分片，保存到 {result['index']}"
     )
+    if result.get("skipped_files"):
+        print(f"[警告] 以下文件无法读取，已跳过: {result['skipped_files']}")
 
 
 def ask_command(args: argparse.Namespace) -> None:
