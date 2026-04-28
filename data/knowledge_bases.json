@@ -5,16 +5,16 @@
       "name": "剑来知识库",
       "description": "剑来小说1-500章本地知识库",
       "created_at": "2026-04-27T21:43:27.300319",
-      "document_count": 1,
-      "chunk_count": 4813
+      "document_count": 2,
+      "chunk_count": 6
     },
     {
       "id": "73493908",
       "name": "新测试KB",
       "description": "",
       "created_at": "2026-04-28T15:03:33.385176",
-      "document_count": 2,
-      "chunk_count": 1
+      "document_count": 3,
+      "chunk_count": 591
     }
   ]
 }

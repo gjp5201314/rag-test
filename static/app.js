@@ -11,6 +11,16 @@ const resultsListEl = document.getElementById('resultsList');
 const askForm = document.getElementById('askForm');
 const refreshStatusBtn = document.getElementById('refreshStatusBtn');
 
+const progressContainer = document.getElementById('progressContainer');
+const progressLabel = document.getElementById('progressLabel');
+const progressPercent = document.getElementById('progressPercent');
+const progressFill = document.getElementById('progressFill');
+
+const answerProgressContainer = document.getElementById('answerProgressContainer');
+const answerProgressLabel = document.getElementById('answerProgressLabel');
+const answerProgressPercent = document.getElementById('answerProgressPercent');
+const answerProgressFill = document.getElementById('answerProgressFill');
+
 const kbTabsEl = document.getElementById('kbTabs');
 const askKbTabsEl = document.getElementById('askKbTabs');
 const createKbBtn = document.getElementById('createKbBtn');
@@ -32,10 +42,97 @@ let currentKbId = 'default';
 let askKbId = 'default';
 let activeBuildJobId = null;
 let activeBuildPollPromise = null;
+let buildProgressInterval = null;
+let answerProgressInterval = null;
 
 function setStatusBadge(text, type) {
-  statusBadge.textContent = text;
+  const statusText = statusBadge.querySelector('.status-text') || statusBadge;
+  const spinner = statusBadge.querySelector('.spinner');
+
+  if (statusText !== statusBadge) {
+    statusText.textContent = text;
+  }
+
+  if (spinner) {
+    if (type === 'warn') {
+      spinner.classList.remove('hidden');
+    } else {
+      spinner.classList.add('hidden');
+    }
+  }
+
   statusBadge.className = `status-badge ${type}`;
+}
+
+function showBuildProgress(label = '正在构建索引...') {
+  progressContainer.classList.remove('hidden');
+  progressLabel.textContent = label;
+  progressPercent.textContent = '0%';
+  progressFill.style.width = '0%';
+
+  let progress = 0;
+  const phases = ['正在扫描文件...', '正在解析文档...', '正在创建索引...', '正在保存...'];
+
+  if (buildProgressInterval) clearInterval(buildProgressInterval);
+
+  buildProgressInterval = setInterval(() => {
+    progress += Math.random() * 15;
+    if (progress > 90) progress = 90;
+
+    const phaseIndex = Math.min(Math.floor(progress / 25), phases.length - 1);
+    progressLabel.textContent = phases[phaseIndex];
+    progressPercent.textContent = `${Math.round(progress)}%`;
+    progressFill.style.width = `${progress}%`;
+  }, 500);
+}
+
+function hideBuildProgress() {
+  if (buildProgressInterval) {
+    clearInterval(buildProgressInterval);
+    buildProgressInterval = null;
+  }
+  progressContainer.classList.add('hidden');
+}
+
+function setBuildProgress(percent, label) {
+  if (percent !== undefined) {
+    progressFill.style.width = `${percent}%`;
+    progressPercent.textContent = `${percent}%`;
+  }
+  if (label !== undefined) {
+    progressLabel.textContent = label;
+  }
+}
+
+function showAnswerProgress(label = '正在检索并生成回答...') {
+  answerProgressContainer.classList.remove('hidden');
+  answerProgressLabel.textContent = label;
+  answerProgressPercent.textContent = '0%';
+  answerProgressFill.style.width = '0%';
+
+  let progress = 0;
+
+  if (answerProgressInterval) clearInterval(answerProgressInterval);
+
+  answerProgressInterval = setInterval(() => {
+    progress += Math.random() * 10;
+    if (progress > 85) progress = 85;
+
+    const phase = progress < 30 ? '正在检索文档...' :
+                  progress < 60 ? '正在分析上下文...' :
+                  progress < 80 ? '正在生成回答...' : '正在完成...';
+    answerProgressLabel.textContent = phase;
+    answerProgressPercent.textContent = `${Math.round(progress)}%`;
+    answerProgressFill.style.width = `${progress}%`;
+  }, 400);
+}
+
+function hideAnswerProgress() {
+  if (answerProgressInterval) {
+    clearInterval(answerProgressInterval);
+    answerProgressInterval = null;
+  }
+  answerProgressContainer.classList.add('hidden');
 }
 
 function escapeHtml(text) {
@@ -129,7 +226,7 @@ function renderFileList(files) {
       const filename = btn.dataset.filename;
       if (confirm(`确定删除文件 "${filename}"？`)) {
         try {
-          await requestJson(`/api/kb/${currentKbId}/files/${encodeURIComponent(filename)}`, {
+          await requestJson(`/api/kb/${currentKbId}/files?filename=${encodeURIComponent(filename)}`, {
             method: 'DELETE',
           });
           await loadFiles();
@@ -203,6 +300,7 @@ async function pollBuildJob(jobId) {
       }
 
       setStatusBadge('构建中', 'warn');
+      setBuildProgress(undefined, job.message || '正在构建索引...');
       await sleep(1500);
     }
   })();
@@ -395,6 +493,7 @@ buildBtn.addEventListener('click', async () => {
   setStatusBadge('构建中', 'warn');
   setBuildMessage('正在提交构建任务，请稍候...', true);
   buildBtn.disabled = true;
+  showBuildProgress();
 
   try {
     const data = await requestJson('/api/build', {
@@ -411,11 +510,18 @@ buildBtn.addEventListener('click', async () => {
       throw new Error('服务端未返回构建任务编号');
     }
 
+    setBuildProgress(95, '正在完成...');
+
     const job = await pollBuildJob(jobId);
+
+    setBuildProgress(100, '完成！');
     setBuildMessage(job.message || '索引构建完成');
+    hideBuildProgress();
+
     await loadStatus();
     await loadKbList();
   } catch (error) {
+    hideBuildProgress();
     setBuildMessage(`构建失败：${error.message}`);
     setStatusBadge('异常', 'error');
   } finally {
@@ -432,6 +538,7 @@ askForm.addEventListener('submit', async (event) => {
   answerBlockEl.classList.remove('empty');
   answerMetaEl.textContent = '检索中';
   answerContentEl.textContent = '正在检索本地片段并请求千问模型，请稍候...';
+  showAnswerProgress();
 
   try {
     const data = await requestJson('/api/ask', {
@@ -439,11 +546,20 @@ askForm.addEventListener('submit', async (event) => {
       body: JSON.stringify(payload),
     });
 
+    answerProgressFill.style.width = '100%';
+    answerProgressPercent.textContent = '100%';
+    answerProgressLabel.textContent = '完成！';
+
+    setTimeout(() => {
+      hideAnswerProgress();
+    }, 800);
+
     answerMetaEl.textContent = `已命中 ${data.results.length} 个分片`;
     answerContentEl.textContent = data.answer;
     renderResults(data.results);
     await loadStatus();
   } catch (error) {
+    hideAnswerProgress();
     answerMetaEl.textContent = '请求失败';
     answerContentEl.textContent = error.message;
     renderResults([]);

@@ -365,17 +365,26 @@ class LocalKnowledgeBase:
                     text += page.extract_text() or ""
                 return text
         except ImportError:
-            try:
-                import pdfplumber
-                with pdfplumber.open(file_path) as pdf:
-                    text = ""
-                    for page in pdf.pages:
-                        text += page.extract_text() or ""
-                    return text
-            except ImportError:
-                return ""
-        except Exception:
-            return ""
+            pass
+        except Exception as e:
+            print(f"[警告] PyPDF2 读取 PDF 失败 ({file_path}): {e}")
+
+        try:
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                text = ""
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+                return text
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[警告] pdfplumber 读取 PDF 失败 ({file_path}): {e}")
+
+        print(f"[警告] 无法读取 PDF 文件，缺少必要的库: {file_path}")
+        return ""
 
     def _read_docx_file(self, file_path: Path) -> str:
         try:
@@ -601,14 +610,9 @@ class KnowledgeBaseService:
         
         return True
 
-    def upload_file(self, kb_id: str, file) -> dict:
-        upload_dir = Path(self._get_kb_upload_dir(kb_id))
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        original_filename = file.filename
-
-        name_part = original_filename.rsplit(".", 1)[0] if "." in original_filename else original_filename
-        ext_part = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else ""
+    def _make_safe_filename(self, filename: str) -> str:
+        name_part = filename.rsplit(".", 1)[0] if "." in filename else filename
+        ext_part = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
         safe_name = "".join(c for c in name_part if c not in r'<>:"/\|?*')
         if not safe_name.strip():
@@ -616,6 +620,14 @@ class KnowledgeBaseService:
 
         if ext_part:
             safe_name = f"{safe_name}.{ext_part}"
+        return safe_name
+
+    def upload_file(self, kb_id: str, file) -> dict:
+        upload_dir = Path(self._get_kb_upload_dir(kb_id))
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
+        original_filename = file.filename
+        safe_name = self._make_safe_filename(original_filename)
 
         file_path = upload_dir / safe_name
         counter = 1
@@ -657,7 +669,13 @@ class KnowledgeBaseService:
         return files
 
     def delete_uploaded_file(self, kb_id: str, filename: str) -> bool:
-        file_path = Path(self._get_kb_upload_dir(kb_id)) / secure_filename(filename)
+        from pathlib import Path as P
+        safe_filename = self._make_safe_filename(filename)
+        upload_dir = self._get_kb_upload_dir(kb_id)
+        file_path = P(upload_dir) / safe_filename
+        print(f"[DEBUG] Delete: kb={kb_id}, orig={filename}, safe={safe_filename}, dir={upload_dir}, file={file_path}, exists={file_path.exists()}")
+        actual_files = list(P(upload_dir).glob('*')) if P(upload_dir).exists() else []
+        print(f"[DEBUG] Actual files in dir: {[f.name for f in actual_files]}")
         if file_path.exists() and file_path.is_file():
             file_path.unlink()
             return True
@@ -1005,8 +1023,10 @@ def api_kb_upload(kb_id: str):
     return jsonify(result), 201
 
 
-@app.delete("/api/kb/<kb_id>/files/<filename>")
-def api_kb_file_delete(kb_id: str, filename: str):
+@app.delete("/api/kb/<kb_id>/files")
+def api_kb_file_delete(kb_id: str):
+    from urllib.parse import unquote
+    filename = unquote(request.args.get("filename", ""))
     success = service.delete_uploaded_file(kb_id, filename)
     if success:
         return jsonify({"success": True})

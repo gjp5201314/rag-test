@@ -25,7 +25,19 @@
       <div class="status-card">
         <div>
           <span class="label">系统状态</span>
-          <strong id="statusBadge" class="status-badge idle">检测中</strong>
+          <strong id="statusBadge" class="status-badge idle">
+            <span class="status-text">检测中</span>
+            <span class="spinner hidden"></span>
+          </strong>
+        </div>
+        <div id="progressContainer" class="progress-container hidden">
+          <div class="progress-info">
+            <span id="progressLabel">正在构建索引...</span>
+            <span id="progressPercent">0%</span>
+          </div>
+          <div class="progress-bar">
+            <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+          </div>
         </div>
         <dl class="status-grid">
           <div>
@@ -159,6 +171,15 @@
             <span id="answerMeta">尚未提问</span>
           </div>
           <div id="answerContent" class="answer-content">这里会显示千问基于检索上下文生成的回答。</div>
+          <div id="answerProgressContainer" class="progress-container hidden" style="margin-top: 16px;">
+            <div class="progress-info">
+              <span id="answerProgressLabel">正在检索并生成回答...</span>
+              <span id="answerProgressPercent">0%</span>
+            </div>
+            <div class="progress-bar">
+              <div id="answerProgressFill" class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
         </div>
       </article>
     </section>
